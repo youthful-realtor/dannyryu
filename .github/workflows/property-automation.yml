@@ -1,0 +1,208 @@
+# .github/workflows/property-automation.yml
+# 다중 매물 처리용 메인 자동화 워크플로우
+
+name: Property Automation
+
+# Git Push 권한 추가
+permissions:
+  contents: write
+
+on:
+  # 매일 자정 1분에 자동 실행
+  schedule:
+    - cron: '1 15 * * *'  # UTC 15:01 = KST 00:01
+
+  # 수동 실행 (테스트용)
+  workflow_dispatch:
+    inputs:
+      property_numbers:
+        description: '매물번호들 (콤마로 구분, 선택사항)'
+        required: false
+        default: ''
+      test_mode:
+        description: '테스트 모드'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+        - 'true'
+        - 'false'
+
+jobs:
+  check-schedule:
+    runs-on: ubuntu-latest
+    outputs:
+      has_schedule: ${{ steps.check.outputs.has_schedule }}
+      property_count: ${{ steps.check.outputs.property_count }}
+      properties: ${{ steps.check.outputs.properties }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Check for scheduled properties
+      id: check
+      run: |
+        if [ -f "data/scheduled_properties.json" ]; then
+          echo "has_schedule=true" >> $GITHUB_OUTPUT
+          
+          # JSON에서 매물 정보 추출
+          properties=$(cat data/scheduled_properties.json | jq -r '.properties | join(",")')
+          count=$(cat data/scheduled_properties.json | jq -r '.total_count')
+          
+          echo "properties=${properties}" >> $GITHUB_OUTPUT
+          echo "property_count=${count}" >> $GITHUB_OUTPUT
+          
+          echo "📋 예약된 매물 발견: ${count}개"
+          echo "📊 매물번호: ${properties}"
+        else
+          echo "has_schedule=false" >> $GITHUB_OUTPUT
+          echo "📝 예약된 매물 없음"
+        fi
+
+  automation:
+    needs: check-schedule
+    runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/playwright/python:v1.55.0-noble
+    if: needs.check-schedule.outputs.has_schedule == 'true' || github.event.inputs.property_numbers != ''
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install playwright
+        echo "✅ Playwright 패키지 설치 완료 (브라우저와 시스템 의존성은 컨테이너에 사전 설치됨)"
+    
+    - name: Determine property numbers
+      id: properties
+      run: |
+        if [ -n "${{ github.event.inputs.property_numbers }}" ]; then
+          # 수동 입력된 매물번호 사용
+          echo "properties=${{ github.event.inputs.property_numbers }}" >> $GITHUB_OUTPUT
+          echo "source=manual" >> $GITHUB_OUTPUT
+        else
+          # 예약 파일에서 매물번호 사용
+          echo "properties=${{ needs.check-schedule.outputs.properties }}" >> $GITHUB_OUTPUT
+          echo "source=scheduled" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Run multi-property automation
+      run: |
+        echo "🚀 다중 매물 자동화 시작..."
+        echo "📋 처리할 매물: ${{ steps.properties.outputs.properties }}"
+        echo "📊 매물 개수: $(echo '${{ steps.properties.outputs.properties }}' | tr ',' '\n' | wc -l)"
+        echo "🔧 테스트 모드: ${{ github.event.inputs.test_mode || 'false' }}"
+        
+        python multi_property_automation.py
+      env:
+        LOGIN_ID: ${{ secrets.LOGIN_ID }}
+        LOGIN_PASSWORD: ${{ secrets.LOGIN_PASSWORD }}
+        PROPERTY_NUMBERS: ${{ steps.properties.outputs.properties }}
+        TEST_MODE: ${{ github.event.inputs.test_mode || 'false' }}
+        TZ: Asia/Seoul
+    
+    - name: Delete completed schedule
+      if: always() && steps.properties.outputs.source == 'scheduled'
+      run: |
+        if [ -f "data/scheduled_properties.json" ]; then
+          rm data/scheduled_properties.json
+          echo "🗑️ 예약 파일 삭제 완료: scheduled_properties.json"
+        else
+          echo "📝 삭제할 예약 파일이 없습니다."
+        fi
+
+    - name: Create execution log
+      if: always()
+      run: |
+        timestamp=$(date +"%Y%m%d_%H%M%S")
+        mkdir -p results
+        
+        cat > results/execution_${timestamp}.json << EOF
+        {
+          "executed_at": "$(date -Iseconds)",
+          "properties": "${{ steps.properties.outputs.properties }}",
+          "property_count": $(echo '${{ steps.properties.outputs.properties }}' | tr ',' '\n' | wc -l),
+          "test_mode": "${{ github.event.inputs.test_mode || 'false' }}",
+          "source": "${{ steps.properties.outputs.source }}",
+          "status": "completed"
+        }
+        EOF
+        
+        echo "📝 실행 로그 생성: results/execution_${timestamp}.json"
+    
+    - name: Commit results
+      if: always()
+      run: |
+        # Docker 컨테이너에서 Git 리포지토리 인식 (동적 경로 사용)
+        git config --global --add safe.directory $GITHUB_WORKSPACE
+        git config --global user.email "action@github.com"
+        git config --global user.name "GitHub Action"
+
+        # 변경사항 확인
+        git status
+
+        # Pull 먼저 수행 (conflict 방지)
+        git pull --rebase || true
+
+        # 스테이징
+        git add results/ data/ || true
+
+        # 커밋 (변경사항이 있을 때만)
+        if git diff --staged --quiet; then
+          echo "📝 변경사항 없음 - 커밋 건너뜀"
+        else
+          git commit -m "🤖 자동화 실행 완료 $(date +"%Y-%m-%d %H:%M:%S")"
+          echo "✅ 커밋 완료"
+
+          # Push (최대 3회 재시도)
+          for i in 1 2 3; do
+            if git push; then
+              echo "✅ Push 성공 (시도 $i)"
+              break
+            else
+              echo "⚠️ Push 실패 (시도 $i) - 재시도..."
+              sleep 2
+              git pull --rebase || true
+            fi
+          done
+        fi
+    
+    - name: Upload screenshots
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: automation-screenshots-${{ github.run_number }}
+        path: "*.png"
+        retention-days: 7
+    
+    - name: Upload logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: automation-logs-${{ github.run_number }}
+        path: |
+          *.log
+          results/
+        retention-days: 30
+
+  no-schedule:
+    needs: check-schedule
+    runs-on: ubuntu-latest
+    if: needs.check-schedule.outputs.has_schedule == 'false' && github.event.inputs.property_numbers == ''
+    
+    steps:
+    - name: No automation needed
+      run: |
+        echo "ℹ️ 실행할 자동화 작업이 없습니다."
+        echo ""
+        echo "📋 예약된 매물: 없음"
+        echo "📝 수동 입력: 없음"
+        echo ""
+        echo "💡 매물을 예약하려면:"
+        echo "1. PC GUI에서 매물 선택"
+        echo "2. GitHub에 scheduled_properties.json 업로드"
+        echo "3. 다음 자정에 자동 실행됨"
